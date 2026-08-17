@@ -1,0 +1,711 @@
+'use client';
+
+import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
+import AsyncStorage from '@/lib/localStore';
+import type { Appliance, BackupDecision, SystemSummary } from '@/types/system.types';
+import type { Product } from '@/types/product.types';
+import { defaultAppliances } from '@/constants/products';
+import {
+  calculatePanelCount,
+  calculateRoofSpace,
+  recommendSolarKw,
+  type BackupRequirementSummary,
+  type PanelOrientation
+} from '@/utils/calculations';
+import { getProductWatt, getRecommendedPackageById, type RecommendedPackage } from '@/utils/packageBuilder';
+import type { BatteryConfiguration } from '@/utils/batteryRecommendation';
+import { BATTERY_RECOMMENDATION_ENGINE_VERSION } from '@/utils/commercialRecommendation';
+import type { CleaningEstimate } from '@/utils/cleaningPricing';
+import type { PromoContext, PromoState } from '@/types/promo.types';
+import { promoApi } from '@/services/browser';
+import { createInitialPromoState, promoContextSignature, sanitizePromoInput } from '@/utils/promo';
+import {
+  EMPTY_CUSTOM_SYSTEM_BUILDER,
+  toCustomSystemComponent,
+  type CustomSystemBuilderState,
+  type CustomSystemComponent
+} from '@/utils/customSystemBuilder';
+
+export type InstallationStructureType = 'standard' | 'elevated' | 'ground_mounted' | 'shed';
+export type BookingContext = 'general' | 'solar_package' | 'custom_system' | 'cleaning' | 'installation' | 'electrical';
+
+export type InstallationDetails = {
+  panelWattage: number;
+  numberOfPanels: number;
+  inverterSizeKw: number;
+  inverterBrand: string;
+  batterySizeKwh: number;
+  batteryBrand: string;
+  structureType: InstallationStructureType;
+};
+
+export const designSystemSteps = ['appliances', 'solar', 'roof', 'backupNeed', 'backupAppliances', 'backupPlan', 'recommended', 'packages'] as const;
+export type DesignSystemStep = typeof designSystemSteps[number];
+
+type SystemState = {
+  appliances: Appliance[];
+  backupAppliances: Appliance[];
+  designStarted: boolean;
+  lastDesignStep: DesignSystemStep;
+  recommendedSolarKw: number;
+  selectedBatteryKwh: number;
+  backupRequirementSummary: BackupRequirementSummary | null;
+  selectedBatteryConfiguration: BatteryConfiguration | null;
+  batteryRecommendationRequirementKwh: number | null;
+  batteryRecommendationEngineVersion: number;
+  panelWattage: number;
+  panelOrientation: PanelOrientation;
+  panelQuantityOverride: number | null;
+  selectedPanelBrand: string | null;
+  backupDecision: BackupDecision;
+  selectedPanels: Product | null;
+  selectedInverter: Product | null;
+  selectedBattery: Product | null;
+  selectedAccessories: Product[];
+  customSystemBuilder: CustomSystemBuilderState;
+  packageName: string;
+  recommendedPackages: RecommendedPackage[];
+  selectedRecommendedPackageId: string | null;
+  selectedRecommendedPackage: RecommendedPackage | null;
+  bookingContext: BookingContext;
+  cleaningEstimate: CleaningEstimate | null;
+  installationDetails: InstallationDetails | null;
+  promo: PromoState;
+  setDesignProgress: (step: DesignSystemStep) => void;
+  setApplianceQuantity: (id: string, quantity: number) => void;
+  addAppliance: (appliance: Appliance) => void;
+  setBackupApplianceQuantity: (id: string, quantity: number) => void;
+  setBackupApplianceHours: (id: string, hours: number) => void;
+  addBackupAppliance: (appliance: Appliance) => void;
+  calculateRecommendation: () => void;
+  setRecommendedSolarKw: (kw: number) => void;
+  setSelectedBatteryKwh: (kwh: number) => void;
+  setBackupRequirementSummary: (summary: BackupRequirementSummary | null) => void;
+  setSelectedBatteryConfiguration: (
+    configuration: BatteryConfiguration | null,
+    requirementKwh?: number | null
+  ) => void;
+  setPanelWattage: (wattage: number) => void;
+  setPanelOrientation: (orientation: PanelOrientation) => void;
+  setPanelLayoutSelection: (selection: {
+    panelQuantity: number;
+    panelWattage: number;
+    orientation: PanelOrientation;
+    panelProduct?: Product | null;
+  }) => void;
+  setSelectedPanelBrand: (brand: string) => void;
+  setBackupDecision: (decision: BackupDecision) => void;
+  setSelectedProduct: (product: Product) => void;
+  startCustomSystemBuilder: (product: Product) => void;
+  selectCustomSystemProduct: (product: Product, quantity?: number) => void;
+  setCustomPanelSelection: (selection: { product: Product; quantity: number; wattage: number }) => void;
+  resetCustomSystemBuilder: () => void;
+  setPackageName: (name: string) => void;
+  setRecommendedPackages: (packages: RecommendedPackage[]) => void;
+  setSelectedRecommendedPackage: (recommendedPackage: RecommendedPackage | null) => void;
+  clearSelectedRecommendedPackage: () => void;
+  startBooking: (context: BookingContext) => void;
+  setCleaningEstimate: (estimate: CleaningEstimate) => void;
+  clearCleaningEstimate: () => void;
+  setInstallationDetails: (details: InstallationDetails) => void;
+  clearInstallationDetails: () => void;
+  setPromoInput: (value: string) => void;
+  applyPromo: (context: PromoContext, codeOverride?: string) => Promise<boolean>;
+  syncPromoContext: (context: PromoContext) => Promise<void>;
+  removePromo: (originalTotal?: number) => void;
+  resetPromo: () => void;
+  getRecommendedPackageById: (packageId: string) => RecommendedPackage | null;
+  getSummary: () => SystemSummary;
+  reset: () => void;
+};
+
+const initialAppliances = defaultAppliances;
+const DEFAULT_BACKUP_HOURS = 1;
+
+export const useSystemStore = create<SystemState>()(persist((set, get) => ({
+  appliances: initialAppliances,
+  backupAppliances: initialAppliances.map((item) => ({ ...item, quantity: 0, hours: DEFAULT_BACKUP_HOURS })),
+  designStarted: false,
+  lastDesignStep: 'appliances',
+  recommendedSolarKw: 3,
+  selectedBatteryKwh: 0,
+  backupRequirementSummary: null,
+  selectedBatteryConfiguration: null,
+  batteryRecommendationRequirementKwh: null,
+  batteryRecommendationEngineVersion: BATTERY_RECOMMENDATION_ENGINE_VERSION,
+  panelWattage: 610,
+  panelOrientation: 'landscape',
+  panelQuantityOverride: null,
+  selectedPanelBrand: null,
+  backupDecision: null,
+  selectedPanels: null,
+  selectedInverter: null,
+  selectedBattery: null,
+  selectedAccessories: [],
+  customSystemBuilder: { ...EMPTY_CUSTOM_SYSTEM_BUILDER },
+  packageName: 'Balanced',
+  recommendedPackages: [],
+  selectedRecommendedPackageId: null,
+  selectedRecommendedPackage: null,
+  bookingContext: 'general',
+  cleaningEstimate: null,
+  installationDetails: null,
+  promo: createInitialPromoState(),
+  setDesignProgress: (lastDesignStep) => set({ designStarted: true, lastDesignStep }),
+  setApplianceQuantity: (id, quantity) => set((state) => ({
+    designStarted: true,
+    appliances: state.appliances.map((item) => item.id === id ? { ...item, quantity: Math.max(0, quantity) } : item),
+    recommendedPackages: [],
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  })),
+  addAppliance: (appliance) => set((state) => {
+    if (state.appliances.some((item) => item.id === appliance.id)) {
+      return {
+        designStarted: true,
+        appliances: state.appliances.map((item) => item.id === appliance.id ? { ...item, quantity: Math.max(1, item.quantity) } : item),
+        recommendedPackages: [],
+        selectedRecommendedPackageId: null,
+        selectedRecommendedPackage: null
+      };
+    }
+    return {
+      designStarted: true,
+      appliances: [...state.appliances, appliance],
+      recommendedPackages: [],
+      selectedRecommendedPackageId: null,
+      selectedRecommendedPackage: null
+    };
+  }),
+  setBackupApplianceQuantity: (id, quantity) => set((state) => ({
+    designStarted: true,
+    backupAppliances: state.backupAppliances.map((item) => item.id === id ? { ...item, quantity: Math.max(0, quantity) } : item),
+    backupRequirementSummary: null,
+    recommendedPackages: [],
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  })),
+  setBackupApplianceHours: (id, hours) => set((state) => ({
+    designStarted: true,
+    backupAppliances: state.backupAppliances.map((item) => item.id === id ? { ...item, hours } : item),
+    backupRequirementSummary: null,
+    recommendedPackages: [],
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  })),
+  addBackupAppliance: (appliance) => set((state) => {
+    if (state.backupAppliances.some((item) => item.id === appliance.id)) {
+      return {
+        designStarted: true,
+        backupAppliances: state.backupAppliances.map((item) => item.id === appliance.id ? { ...item, quantity: Math.max(1, item.quantity) } : item),
+        backupRequirementSummary: null,
+        recommendedPackages: [],
+        selectedRecommendedPackageId: null,
+        selectedRecommendedPackage: null
+      };
+    }
+    return {
+      designStarted: true,
+      backupAppliances: [...state.backupAppliances, appliance],
+      backupRequirementSummary: null,
+      recommendedPackages: [],
+      selectedRecommendedPackageId: null,
+      selectedRecommendedPackage: null
+    };
+  }),
+  calculateRecommendation: () => set((state) => {
+    const selectedQuantity = state.appliances.reduce(
+      (total, item) => total + Math.max(0, Number(item.quantity) || 0),
+      0
+    );
+    if (selectedQuantity <= 0) return {};
+    return {
+      designStarted: true,
+      recommendedSolarKw: recommendSolarKw(state.appliances),
+      panelQuantityOverride: null,
+      recommendedPackages: [],
+      selectedRecommendedPackageId: null,
+      selectedRecommendedPackage: null
+    };
+  }),
+  setRecommendedSolarKw: (recommendedSolarKw) => set({
+    designStarted: true,
+    recommendedSolarKw,
+    panelQuantityOverride: null,
+    recommendedPackages: [],
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  }),
+  setSelectedBatteryKwh: (selectedBatteryKwh) => set((state) => ({
+    designStarted: true,
+    selectedBatteryKwh,
+    selectedBatteryConfiguration: state.selectedBatteryConfiguration?.capacityKwh === selectedBatteryKwh
+      ? state.selectedBatteryConfiguration
+      : null,
+    batteryRecommendationRequirementKwh: null,
+    batteryRecommendationEngineVersion: BATTERY_RECOMMENDATION_ENGINE_VERSION,
+    recommendedPackages: [],
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  })),
+  setBackupRequirementSummary: (backupRequirementSummary) => set({
+    designStarted: true,
+    backupRequirementSummary
+  }),
+  setSelectedBatteryConfiguration: (
+    selectedBatteryConfiguration,
+    batteryRecommendationRequirementKwh = null
+  ) => set({
+    designStarted: true,
+    selectedBatteryKwh: selectedBatteryConfiguration?.capacityKwh ?? 0,
+    selectedBatteryConfiguration,
+    batteryRecommendationRequirementKwh,
+    batteryRecommendationEngineVersion: BATTERY_RECOMMENDATION_ENGINE_VERSION,
+    selectedBattery: selectedBatteryConfiguration?.primaryProduct ?? null,
+    recommendedPackages: [],
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  }),
+  setPanelWattage: (panelWattage) => set({
+    designStarted: true,
+    panelWattage,
+    recommendedPackages: [],
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  }),
+  setPanelOrientation: (panelOrientation) => set({ designStarted: true, panelOrientation }),
+  setPanelLayoutSelection: ({ panelQuantity, panelWattage, orientation, panelProduct = null }) => set({
+    designStarted: true,
+    lastDesignStep: 'roof',
+    panelWattage,
+    panelOrientation: orientation,
+    panelQuantityOverride: Math.max(1, Math.ceil(panelQuantity || 1)),
+    recommendedSolarKw: (Math.max(1, Math.ceil(panelQuantity || 1)) * panelWattage) / 1000,
+    selectedPanels: panelProduct,
+    selectedPanelBrand: panelProduct?.brandName ?? panelProduct?.brand ?? null,
+    recommendedPackages: [],
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  }),
+  setSelectedPanelBrand: (selectedPanelBrand) => set({ designStarted: true, selectedPanelBrand }),
+  setBackupDecision: (backupDecision) => set((state) => ({
+    designStarted: true,
+    backupDecision,
+    selectedBatteryKwh: backupDecision === 'no' ? 0 : state.selectedBatteryKwh,
+    backupRequirementSummary: backupDecision === 'no' ? null : state.backupRequirementSummary,
+    selectedBatteryConfiguration: backupDecision === 'no' ? null : state.selectedBatteryConfiguration,
+    batteryRecommendationRequirementKwh: backupDecision === 'no'
+      ? null
+      : state.batteryRecommendationRequirementKwh,
+    batteryRecommendationEngineVersion: BATTERY_RECOMMENDATION_ENGINE_VERSION,
+    selectedBattery: backupDecision === 'no' ? null : state.selectedBattery,
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  })),
+  setSelectedProduct: (product) => set((state) => {
+    if (product.category === 'panel') return { designStarted: true, selectedPanels: product };
+    if (product.category === 'inverter') return { designStarted: true, selectedInverter: product };
+    if (product.category === 'battery') return { designStarted: true, selectedBattery: product };
+    return { designStarted: true, selectedAccessories: [...state.selectedAccessories.filter((item) => item.id !== product.id), product] };
+  }),
+  startCustomSystemBuilder: (product) => set((state) => {
+    const sourceComponent = toCustomSystemComponent(product.category);
+    if (!sourceComponent) return {};
+    const panelWattage = sourceComponent === 'panel'
+      ? Math.max(1, Math.round(getProductWatt(product) || state.panelWattage || 1))
+      : 0;
+    // A marketplace panel product does not imply a previous sizing result.
+    // Start with one unit and let the customer edit solar size explicitly.
+    const panelQuantity = sourceComponent === 'panel' ? 1 : 0;
+    return {
+      designStarted: true,
+      selectedPanels: sourceComponent === 'panel' ? product : null,
+      selectedInverter: sourceComponent === 'inverter' ? product : null,
+      selectedBattery: sourceComponent === 'battery' ? product : null,
+      backupDecision: sourceComponent === 'battery' ? 'yes' as const : null,
+      panelWattage: panelWattage || state.panelWattage,
+      panelQuantityOverride: panelQuantity || null,
+      selectedRecommendedPackageId: null,
+      selectedRecommendedPackage: null,
+      bookingContext: 'custom_system' as const,
+      promo: createInitialPromoState(),
+      customSystemBuilder: {
+        active: true,
+        selectedPanel: sourceComponent === 'panel' ? product : null,
+        selectedPanelQuantity: panelQuantity,
+        selectedPanelWattage: panelWattage,
+        selectedInverter: sourceComponent === 'inverter' ? product : null,
+        selectedBattery: sourceComponent === 'battery' ? product : null,
+        selectedBatteryQuantity: sourceComponent === 'battery' ? 1 : 0,
+        sourceComponent,
+        selectedComponentOrder: [sourceComponent]
+      }
+    };
+  }),
+  selectCustomSystemProduct: (product, quantity = 1) => set((state) => {
+    const component = toCustomSystemComponent(product.category);
+    if (!component) return {};
+    const order: CustomSystemComponent[] = state.customSystemBuilder.selectedComponentOrder.includes(component)
+      ? state.customSystemBuilder.selectedComponentOrder
+      : [...state.customSystemBuilder.selectedComponentOrder, component];
+    const customSystemBuilder: CustomSystemBuilderState = {
+      ...state.customSystemBuilder,
+      active: true,
+      selectedPanel: component === 'panel' ? product : state.customSystemBuilder.selectedPanel,
+      selectedPanelQuantity: component === 'panel'
+        ? Math.max(1, Math.round(quantity || 1))
+        : state.customSystemBuilder.selectedPanelQuantity,
+      selectedPanelWattage: component === 'panel'
+        ? Math.max(1, Math.round(getProductWatt(product) || state.panelWattage || 1))
+        : state.customSystemBuilder.selectedPanelWattage,
+      selectedInverter: component === 'inverter' ? product : state.customSystemBuilder.selectedInverter,
+      selectedBattery: component === 'battery' ? product : state.customSystemBuilder.selectedBattery,
+      selectedBatteryQuantity: component === 'battery'
+        ? Math.max(1, Math.round(quantity || 1))
+        : state.customSystemBuilder.selectedBatteryQuantity,
+      sourceComponent: state.customSystemBuilder.sourceComponent ?? component,
+      selectedComponentOrder: order
+    };
+    return {
+      designStarted: true,
+      selectedPanels: customSystemBuilder.selectedPanel,
+      selectedInverter: customSystemBuilder.selectedInverter,
+      selectedBattery: customSystemBuilder.selectedBattery,
+      backupDecision: customSystemBuilder.selectedBattery ? 'yes' as const : state.backupDecision,
+      selectedRecommendedPackageId: null,
+      selectedRecommendedPackage: null,
+      bookingContext: 'custom_system' as const,
+      customSystemBuilder
+    };
+  }),
+  setCustomPanelSelection: ({ product, quantity, wattage }) => set((state) => {
+    const normalizedQuantity = Math.max(1, Math.round(quantity || 1));
+    const normalizedWattage = Math.max(1, Math.round(wattage || getProductWatt(product) || 1));
+    const order: CustomSystemComponent[] = state.customSystemBuilder.selectedComponentOrder.includes('panel')
+      ? state.customSystemBuilder.selectedComponentOrder
+      : [...state.customSystemBuilder.selectedComponentOrder, 'panel'];
+    return {
+      designStarted: true,
+      recommendedSolarKw: (normalizedQuantity * normalizedWattage) / 1000,
+      panelWattage: normalizedWattage,
+      panelQuantityOverride: normalizedQuantity,
+      selectedPanelBrand: product.brandName ?? product.brand,
+      selectedPanels: product,
+      selectedRecommendedPackageId: null,
+      selectedRecommendedPackage: null,
+      bookingContext: 'custom_system' as const,
+      customSystemBuilder: {
+        ...state.customSystemBuilder,
+        active: true,
+        selectedPanel: product,
+        selectedPanelQuantity: normalizedQuantity,
+        selectedPanelWattage: normalizedWattage,
+        sourceComponent: state.customSystemBuilder.sourceComponent ?? 'panel',
+        selectedComponentOrder: order
+      }
+    };
+  }),
+  resetCustomSystemBuilder: () => set({ customSystemBuilder: { ...EMPTY_CUSTOM_SYSTEM_BUILDER } }),
+  setPackageName: (packageName) => set({ designStarted: true, lastDesignStep: 'packages', packageName }),
+  setRecommendedPackages: (recommendedPackages) => set((state) => {
+    const regeneratedSelection = getRecommendedPackageById(
+      recommendedPackages,
+      state.selectedRecommendedPackageId
+    );
+    const selectedRecommendedPackage = state.selectedRecommendedPackage?.isCustomized && regeneratedSelection
+      ? state.selectedRecommendedPackage
+      : regeneratedSelection;
+    return {
+      recommendedPackages,
+      selectedRecommendedPackageId: selectedRecommendedPackage ? selectedRecommendedPackage.id : null,
+      selectedRecommendedPackage
+    };
+  }),
+  setSelectedRecommendedPackage: (selectedRecommendedPackage) => set({
+    designStarted: true,
+    lastDesignStep: 'packages',
+    packageName: selectedRecommendedPackage?.packageName ?? 'Balanced',
+    selectedRecommendedPackageId: selectedRecommendedPackage?.id ?? null,
+    selectedRecommendedPackage,
+    customSystemBuilder: selectedRecommendedPackage
+      ? { ...EMPTY_CUSTOM_SYSTEM_BUILDER }
+      : get().customSystemBuilder,
+    bookingContext: selectedRecommendedPackage ? 'solar_package' : 'general',
+    cleaningEstimate: null,
+    installationDetails: null
+  }),
+  clearSelectedRecommendedPackage: () => set({
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null
+  }),
+  startBooking: (bookingContext) => set(() => {
+    if (bookingContext === 'cleaning') {
+      return {
+        bookingContext,
+        selectedRecommendedPackageId: null,
+        selectedRecommendedPackage: null,
+        installationDetails: null,
+        promo: createInitialPromoState()
+      };
+    }
+    if (bookingContext === 'installation') {
+      return {
+        bookingContext,
+        selectedRecommendedPackageId: null,
+        selectedRecommendedPackage: null,
+        cleaningEstimate: null,
+        promo: createInitialPromoState()
+      };
+    }
+    if (bookingContext === 'solar_package' || bookingContext === 'custom_system') {
+      return {
+        bookingContext,
+        cleaningEstimate: null,
+        installationDetails: null
+      };
+    }
+    if (bookingContext === 'electrical') {
+      return {
+        bookingContext,
+        selectedRecommendedPackageId: null,
+        selectedRecommendedPackage: null,
+        cleaningEstimate: null,
+        installationDetails: null,
+        promo: createInitialPromoState()
+      };
+    }
+    return {
+      bookingContext: 'general',
+      selectedRecommendedPackageId: null,
+      selectedRecommendedPackage: null,
+      cleaningEstimate: null,
+      installationDetails: null,
+      promo: createInitialPromoState()
+    };
+  }),
+  setCleaningEstimate: (cleaningEstimate) => set({
+    bookingContext: 'cleaning',
+    cleaningEstimate,
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null,
+    installationDetails: null,
+    promo: createInitialPromoState()
+  }),
+  clearCleaningEstimate: () => set({ cleaningEstimate: null }),
+  setInstallationDetails: (installationDetails) => set({
+    bookingContext: 'installation',
+    installationDetails,
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null,
+    cleaningEstimate: null,
+    promo: createInitialPromoState()
+  }),
+  clearInstallationDetails: () => set({ installationDetails: null }),
+  setPromoInput: (value) => set((state) => {
+    const enteredCode = sanitizePromoInput(value);
+    if (state.promo.appliedCode && enteredCode !== state.promo.appliedCode) {
+      return {
+        promo: {
+          ...createInitialPromoState(state.promo.originalTotal),
+          enteredCode
+        }
+      };
+    }
+    return {
+      promo: {
+        ...state.promo,
+        enteredCode,
+        status: state.promo.status !== 'applied' && state.promo.status !== 'loading' ? 'idle' : state.promo.status,
+        message: state.promo.status !== 'applied' && state.promo.status !== 'loading' ? null : state.promo.message
+      }
+    };
+  }),
+  applyPromo: async (context, codeOverride) => {
+    const current = get().promo;
+    if (current.status === 'loading') return false;
+    const enteredCode = sanitizePromoInput(codeOverride ?? current.enteredCode);
+    if (!enteredCode) {
+      set({
+        promo: {
+          ...createInitialPromoState(context.originalTotal),
+          status: 'invalid',
+          message: 'Enter a promo code.'
+        }
+      });
+      return false;
+    }
+
+    set({
+      promo: {
+        ...current,
+        enteredCode,
+        originalTotal: context.originalTotal,
+        finalTotal: context.originalTotal,
+        discountAmount: 0,
+        status: 'loading',
+        message: 'Applying promo code...'
+      }
+    });
+
+    const result = await promoApi.validatePromoCode(enteredCode, context);
+    if (!result.valid) {
+      set({
+        promo: {
+          ...createInitialPromoState(result.originalTotal),
+          enteredCode,
+          status: result.status,
+          message: result.message
+        }
+      });
+      return false;
+    }
+
+    set({
+      promo: {
+        enteredCode: result.code,
+        appliedCode: result.code,
+        promoId: result.promoId,
+        discountType: result.discountType,
+        discountValue: result.discountValue,
+        appliesTo: result.appliesTo,
+        eligibleAmount: result.eligibleAmount,
+        discountAmount: result.discountAmount,
+        originalTotal: result.originalTotal,
+        finalTotal: result.finalTotal,
+        appliedPackageId: context.packageId,
+        appliedContextSignature: promoContextSignature(context),
+        status: 'applied',
+        message: result.message
+      }
+    });
+    return true;
+  },
+  syncPromoContext: async (context) => {
+    const current = get().promo;
+    const contextChanged = current.appliedContextSignature !== promoContextSignature(context);
+    if (current.appliedCode && contextChanged) {
+      await get().applyPromo(context, current.appliedCode);
+      return;
+    }
+    if (!current.appliedCode && current.finalTotal !== context.originalTotal) {
+      set({
+        promo: {
+          ...current,
+          originalTotal: context.originalTotal,
+          finalTotal: context.originalTotal,
+          discountAmount: 0
+        }
+      });
+    }
+  },
+  removePromo: (originalTotal) => set((state) => ({
+    promo: createInitialPromoState(originalTotal ?? state.promo.originalTotal)
+  })),
+  resetPromo: () => set({ promo: createInitialPromoState() }),
+  getRecommendedPackageById: (packageId) => getRecommendedPackageById(get().recommendedPackages, packageId),
+  getSummary: () => {
+    const state = get();
+    const panelCount = state.panelQuantityOverride ?? calculatePanelCount(state.recommendedSolarKw, state.panelWattage);
+    return {
+      solarKw: state.recommendedSolarKw,
+      panelWattage: state.panelWattage,
+      selectedPanelBrand: state.selectedPanelBrand,
+      panelCount,
+      roofAreaSqFt: calculateRoofSpace(panelCount).areaSqFt,
+      inverter: state.selectedInverter,
+      battery: state.backupDecision === 'yes'
+        ? state.selectedBatteryConfiguration?.primaryProduct ?? state.selectedBattery
+        : null,
+      panels: state.selectedPanels,
+      accessories: state.selectedAccessories,
+      packageName: state.selectedRecommendedPackage?.packageName ?? state.packageName,
+      selectedRecommendedPackageId: state.selectedRecommendedPackageId,
+      selectedRecommendedPackage: state.selectedRecommendedPackage,
+      selectedBatteryConfiguration: state.selectedBatteryConfiguration,
+      customSystemBuilder: state.customSystemBuilder
+    };
+  },
+  reset: () => set({
+    appliances: initialAppliances,
+    backupAppliances: initialAppliances.map((item) => ({ ...item, quantity: 0, hours: DEFAULT_BACKUP_HOURS })),
+    designStarted: false,
+    lastDesignStep: 'appliances',
+    recommendedSolarKw: 3,
+    selectedBatteryKwh: 0,
+    backupRequirementSummary: null,
+    selectedBatteryConfiguration: null,
+    batteryRecommendationRequirementKwh: null,
+    batteryRecommendationEngineVersion: BATTERY_RECOMMENDATION_ENGINE_VERSION,
+    panelWattage: 610,
+    panelOrientation: 'landscape',
+    panelQuantityOverride: null,
+    selectedPanelBrand: null,
+    backupDecision: null,
+    selectedPanels: null,
+    selectedInverter: null,
+    selectedBattery: null,
+    selectedAccessories: [],
+    customSystemBuilder: { ...EMPTY_CUSTOM_SYSTEM_BUILDER },
+    packageName: 'Balanced',
+    recommendedPackages: [],
+    selectedRecommendedPackageId: null,
+    selectedRecommendedPackage: null,
+    bookingContext: 'general',
+    cleaningEstimate: null,
+    installationDetails: null,
+    promo: createInitialPromoState()
+  })
+}), {
+  name: 'kaamasaan-system-draft',
+  storage: createJSONStorage(() => AsyncStorage),
+  partialize: (state) => ({
+    appliances: state.appliances,
+    backupAppliances: state.backupAppliances,
+    designStarted: state.designStarted,
+    lastDesignStep: state.lastDesignStep,
+    recommendedSolarKw: state.recommendedSolarKw,
+    selectedBatteryKwh: state.selectedBatteryKwh,
+    selectedBatteryConfiguration: state.selectedBatteryConfiguration,
+    backupRequirementSummary: state.backupRequirementSummary,
+    batteryRecommendationRequirementKwh: state.batteryRecommendationRequirementKwh,
+    batteryRecommendationEngineVersion: state.batteryRecommendationEngineVersion,
+    panelWattage: state.panelWattage,
+    panelOrientation: state.panelOrientation,
+    panelQuantityOverride: state.panelQuantityOverride,
+    selectedPanelBrand: state.selectedPanelBrand,
+    backupDecision: state.backupDecision,
+    selectedPanels: state.selectedPanels,
+    selectedInverter: state.selectedInverter,
+    selectedBattery: state.selectedBattery,
+    selectedAccessories: state.selectedAccessories,
+    customSystemBuilder: state.customSystemBuilder,
+    packageName: state.packageName,
+    selectedRecommendedPackageId: state.selectedRecommendedPackageId,
+    selectedRecommendedPackage: state.selectedRecommendedPackage,
+    bookingContext: state.bookingContext,
+    cleaningEstimate: state.cleaningEstimate,
+    installationDetails: state.installationDetails,
+    promo: state.promo
+  }),
+  version: 7,
+  migrate: (persistedState) => {
+    const state = persistedState as Partial<SystemState> | undefined;
+    return {
+      ...state,
+      selectedBatteryKwh: 0,
+      selectedBatteryConfiguration: null,
+      batteryRecommendationRequirementKwh: null,
+      batteryRecommendationEngineVersion: BATTERY_RECOMMENDATION_ENGINE_VERSION,
+      selectedBattery: null,
+      customSystemBuilder: state?.customSystemBuilder ?? { ...EMPTY_CUSTOM_SYSTEM_BUILDER },
+      panelOrientation: state?.panelOrientation ?? 'landscape',
+      panelQuantityOverride: state?.panelQuantityOverride ?? null,
+      recommendedPackages: [],
+      selectedRecommendedPackageId: null,
+      selectedRecommendedPackage: null,
+      bookingContext: state?.bookingContext ?? 'general',
+      promo: state?.promo ?? createInitialPromoState()
+    };
+  }
+}));
